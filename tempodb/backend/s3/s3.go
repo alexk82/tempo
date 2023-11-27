@@ -3,6 +3,7 @@ package s3
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/opentracing/opentracing-go"
 
 	tempo_io "github.com/grafana/tempo/pkg/io"
@@ -32,6 +34,7 @@ type readerWriter struct {
 	cfg        *Config
 	core       *minio.Core
 	hedgedCore *minio.Core
+	sse        encrypt.ServerSide
 }
 
 var (
@@ -106,6 +109,11 @@ func internalNew(cfg *Config, confirm bool) (*readerWriter, error) {
 		return nil, fmt.Errorf("unexpected error creating hedgedCore: %w", err)
 	}
 
+	sse, err := createSSE(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("unexpected error creating sse: %w", err)
+	}
+
 	// try listing objects
 	if confirm {
 		_, err = core.ListObjects(cfg.Bucket, cfg.Prefix, "", "/", 0)
@@ -119,16 +127,18 @@ func internalNew(cfg *Config, confirm bool) (*readerWriter, error) {
 		cfg:        cfg,
 		core:       core,
 		hedgedCore: hedgedCore,
+		sse:        sse,
 	}
 	return rw, nil
 }
 
 func getPutObjectOptions(rw *readerWriter) minio.PutObjectOptions {
 	return minio.PutObjectOptions{
-		PartSize:     rw.cfg.PartSize,
-		UserTags:     rw.cfg.Tags,
-		StorageClass: rw.cfg.StorageClass,
-		UserMetadata: rw.cfg.Metadata,
+		PartSize:             rw.cfg.PartSize,
+		UserTags:             rw.cfg.Tags,
+		StorageClass:         rw.cfg.StorageClass,
+		UserMetadata:         rw.cfg.Metadata,
+		ServerSideEncryption: rw.sse,
 	}
 }
 
@@ -200,7 +210,9 @@ func (rw *readerWriter) Append(ctx context.Context, name string, keypath backend
 		a.partNum,
 		bytes.NewReader(buffer),
 		int64(len(buffer)),
-		minio.PutObjectPartOptions{},
+		minio.PutObjectPartOptions{
+			SSE: rw.sse,
+		},
 	)
 	if err != nil {
 		return a, fmt.Errorf("error in multipart upload: %w", err)
@@ -231,7 +243,9 @@ func (rw *readerWriter) CloseAppend(ctx context.Context, tracker backend.AppendT
 		a.objectName,
 		a.uploadID,
 		completeParts,
-		minio.PutObjectOptions{},
+		minio.PutObjectOptions{
+			ServerSideEncryption: rw.sse,
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("error completing multipart upload, object: %s, obj etag: %s: %w", a.objectName, uploadInfo.ETag, err)
@@ -367,7 +381,9 @@ func (rw *readerWriter) ReadVersioned(ctx context.Context, name string, keypath 
 }
 
 func (rw *readerWriter) readAll(ctx context.Context, name string) ([]byte, error) {
-	reader, info, _, err := rw.hedgedCore.GetObject(ctx, rw.cfg.Bucket, name, minio.GetObjectOptions{})
+	reader, info, _, err := rw.hedgedCore.GetObject(ctx, rw.cfg.Bucket, name, minio.GetObjectOptions{
+		ServerSideEncryption: rw.sse,
+	})
 	if err != nil {
 		// do not change or wrap this error
 		// we need to compare the specific err message
@@ -379,7 +395,9 @@ func (rw *readerWriter) readAll(ctx context.Context, name string) ([]byte, error
 }
 
 func (rw *readerWriter) readAllWithObjInfo(ctx context.Context, name string) ([]byte, minio.ObjectInfo, error) {
-	reader, info, _, err := rw.hedgedCore.GetObject(ctx, rw.cfg.Bucket, name, minio.GetObjectOptions{})
+	reader, info, _, err := rw.hedgedCore.GetObject(ctx, rw.cfg.Bucket, name, minio.GetObjectOptions{
+		ServerSideEncryption: rw.sse,
+	})
 	if err != nil && minio.ToErrorResponse(err).Code == s3.ErrCodeNoSuchKey {
 		return nil, minio.ObjectInfo{}, backend.ErrDoesNotExist
 	} else if err != nil {
@@ -395,7 +413,9 @@ func (rw *readerWriter) readAllWithObjInfo(ctx context.Context, name string) ([]
 }
 
 func (rw *readerWriter) readRange(ctx context.Context, objName string, offset int64, buffer []byte) error {
-	options := minio.GetObjectOptions{}
+	options := minio.GetObjectOptions{
+		ServerSideEncryption: rw.sse,
+	}
 	err := options.SetRange(offset, offset+int64(len(buffer)))
 	if err != nil {
 		return fmt.Errorf("error setting headers for range read in s3: %w", err)
@@ -457,6 +477,61 @@ func fetchCreds(cfg *Config) (*credentials.Credentials, error) {
 	}
 
 	return creds, nil
+}
+
+func createSSE(config *Config) (encrypt.ServerSide, error) {
+	var sse encrypt.ServerSide
+	if config.SSE.Type != "" {
+		switch config.SSE.Type {
+		case SSEKMS:
+			encryptionCtx, err := parseKMSEncryptionContext(config.SSE.KMSEncryptionContext)
+			if err != nil {
+				return nil, err
+			}
+
+			// If the KMSEncryptionContext is a nil map the header that is
+			// constructed by the encrypt.ServerSide object will be base64
+			// encoded "nil" which is not accepted by AWS.
+			if encryptionCtx == nil {
+				encryptionCtx = make(map[string]string)
+			}
+			sse, err = encrypt.NewSSEKMS(config.SSE.KMSKeyID, encryptionCtx)
+			if err != nil {
+				return nil, fmt.Errorf("initialize s3 client SSE-KMS: %w", err)
+			}
+
+		case SSEC:
+			key, err := os.ReadFile(config.SSE.EncryptionKey)
+			if err != nil {
+				return nil, fmt.Errorf("initialize s3 client SSE-C: %w", err)
+			}
+
+			sse, err = encrypt.NewSSEC(key)
+			if err != nil {
+				return nil, fmt.Errorf("initialize s3 client SSE-C: %w", err)
+			}
+
+		case SSES3:
+			sse = encrypt.NewSSE()
+
+		default:
+			return nil, fmt.Errorf("initialize s3 client SSE Config: unsupported type %q was provided. Supported types are SSE-S3, SSE-KMS, SSE-C", config.SSE.Type)
+		}
+	}
+	return sse, nil
+}
+
+func parseKMSEncryptionContext(data string) (map[string]string, error) {
+	if data == "" {
+		return nil, nil
+	}
+
+	decoded := map[string]string{}
+	err := json.Unmarshal([]byte(data), &decoded)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse KMS encryption context: %w", err)
+	}
+	return decoded, nil
 }
 
 func createCore(cfg *Config, hedge bool) (*minio.Core, error) {
